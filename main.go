@@ -83,7 +83,7 @@ func eachFeed(config *Config, feedUrl string) error {
 	if chanErr != nil {
 		return chanErr
 	}
-	err = writeFeed("https://kakkun61.hatenablog.com/feed", feedText)
+	err = writeFeed(feedUrl, feedText)
 	if err != nil {
 		return Error{"Failed to write a feed.", err}
 	}
