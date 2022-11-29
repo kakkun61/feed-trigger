@@ -1,0 +1,18 @@
+= feed-trigger
+
+Check Atom or RSS feeds and run a command passing their new feeds to its stdin.
+
+== Settings
+
+Config file should be put at _{XDG Config Home}/feed-trigger/config.yaml_.
+
+.~/.config/feed-trigger/config.yaml
+----
+feeds:
+  - https://kakkun61.hatenablog.com/feed
+run: [cat]
+----
+
+`feeds` is a list of some feed URIs and `run` is a list of strings that represent a command and its arguments.
+
+The feeds passed to a command have new entries only.
