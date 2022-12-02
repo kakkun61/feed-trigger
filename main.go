@@ -1,7 +1,8 @@
 package main
 
 import (
-	"encoding/xml"
+	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"os"
@@ -9,25 +10,33 @@ import (
 
 	"path/filepath"
 
+	"net/http"
 	"net/url"
 
 	"github.com/adrg/xdg"
-	"github.com/wbernest/atom-parser"
+	"github.com/mmcdole/gofeed"
 	"gopkg.in/yaml.v3"
 )
 
 const appName = "feed-trigger"
 
-var dataPath = filepath.Join(xdg.DataHome, appName)
+var dataDirPath = filepath.Join(xdg.DataHome, appName)
+var configDirPath = filepath.Join(xdg.ConfigHome, appName)
 
 func main() {
 	exitCode := 0
+	err := prepareAppDirs()
+	if err != nil {
+		log.Fatal(fmt.Errorf("Failed to prepare app directories. Caused by %w", err))
+	}
 	config, err := readConfig()
 	if err != nil {
-		log.Fatal(Error{"Failed to read a config.", err})
+		log.Fatal(fmt.Errorf("Failed to read a config. Caused by %w", err))
 	}
+	feedParser := gofeed.NewParser()
+	var httpClient http.Client
 	for i := 0; i < len(config.Feeds); i++ {
-		err := eachFeed(config, config.Feeds[i])
+		err := eachFeed(httpClient, *feedParser, *config, config.Feeds[i])
 		if err != nil {
 			log.Println(err)
 			exitCode = 1
@@ -36,56 +45,106 @@ func main() {
 	os.Exit(exitCode)
 }
 
-func eachFeed(config *Config, feedUrl string) error {
-	feed, feedText, err := atomparser.ParseURL(feedUrl)
-	if err != nil {
-		return Error{"Failed to parse a feed.", err}
-	}
-	newFeed := feed
-	prevFeedText, err := readFeed(feedUrl)
-	if err != nil {
-		return Error{"Failed to read a feed.", err}
-	}
-	if prevFeedText != nil {
-		prevFeed, err := atomparser.ParseString(*prevFeedText)
+func prepareAppDirs() error {
+	dirs := []string{dataDirPath, configDirPath}
+	for i := 0; i < len(dirs); i++ {
+		dir := dirs[i]
+		file, err := os.Open(dir)
+		if os.IsNotExist(err) {
+			err := os.Mkdir(dir, os.ModeDir|0755)
+			if err != nil {
+				return fmt.Errorf("Failed to create a directory: %s. Caused by %w", dir, err)
+			}
+			continue
+		}
 		if err != nil {
-			return Error{"Failed to parse a feed.", err}
+			return fmt.Errorf("Failed to open a directory: %s. Caused by %w", dir, err)
 		}
-		newEntries := atomparser.CompareItemsBetweenOldAndNew(prevFeed, feed)
-		if len(newEntries) == 0 {
-			return nil
-		}
-		newFeed.Entry = newEntries
+		file.Close()
 	}
-	newFeedBytes, err := xml.Marshal(newFeed)
+	return nil
+}
+
+func eachFeed(httpClient http.Client, feedParser gofeed.Parser, config Config, feedUrl string) error {
+	feedReader, err := download(httpClient, feedUrl)
 	if err != nil {
-		return Error{"Failed to marshal a feed.", err}
+		return fmt.Errorf("Failed to download a feed: %s. Caused by %w", feedUrl, err)
 	}
-	cmd := exec.Command(config.Run[0], config.Run[1:]...)
-	stdinPipe, err := cmd.StdinPipe()
-	if err != nil {
-		return Error{"Failed to open a standard-in pipe.", err}
-	}
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	var chanErr error
-	go func() {
-		defer stdinPipe.Close()
-		_, err = stdinPipe.Write(newFeedBytes) // 手抜き
+	defer feedReader.Close()
+	var tempFeedFile, prevFeedFile *os.File
+	ret, err := func() (bool, error) {
+		tempFeedFile, err = os.CreateTemp(dataDirPath, "")
 		if err != nil {
-			chanErr = Error{"Failed to write a feed to a standard-in pipe.", err}
+			return true, fmt.Errorf("Failed to create a temporary feed file. Caused by %w", err)
 		}
+		defer tempFeedFile.Close()
+		teedFeedReader := io.TeeReader(feedReader, tempFeedFile)
+		feed, err := feedParser.Parse(teedFeedReader)
+		if err != nil {
+			return true, fmt.Errorf("Failed to parse a feed. Caused by %w", err)
+		}
+		newFeed := *feed
+		ret, err := func() (bool, error) {
+			prevFeedFile, err = os.OpenFile(makeFeedPath(feedUrl), os.O_RDWR, 0644)
+			if err != nil {
+				if !os.IsNotExist(err) {
+					return true, fmt.Errorf("Failed to open a previous feed file. Caused by %w", err)
+				}
+			} else {
+				defer prevFeedFile.Close()
+				prevFeed, err := feedParser.Parse(prevFeedFile)
+				if err != nil {
+					return true, fmt.Errorf("Failed to parse a previous feed. Caused by %w", err)
+				}
+				newFeed = subtractFeed(*prevFeed, *feed)
+				if len(newFeed.Items) == 0 {
+					return true, nil
+				}
+			}
+			return false, nil
+		}()
+		if err != nil {
+			return true, err
+		}
+		if ret {
+			return true, nil
+		}
+		cmd := exec.Command(config.Run[0], config.Run[1:]...)
+		stdinPipe, err := cmd.StdinPipe()
+		if err != nil {
+			return true, fmt.Errorf("Failed to open a standard-in pipe. Caused by %w", err)
+		}
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		var chanErr error
+		go func() {
+			defer stdinPipe.Close()
+			err = json.NewEncoder(stdinPipe).Encode(newFeed) // ここ本来のフォーマットでエンコードしたいけどいい感じのライブラリーがないのでこのまま
+			if err != nil {
+				chanErr = fmt.Errorf("Failed to write a feed to a standard-in pipe. Caused by %w", err)
+			}
+		}()
+		err = cmd.Run()
+		if err != nil {
+			return true, fmt.Errorf("Failed to run a command. Caused by %w", err)
+		}
+		if chanErr != nil {
+			return true, chanErr
+		}
+		return false, nil
 	}()
-	err = cmd.Run()
 	if err != nil {
-		return Error{"Failed to run a command.", err}
+		if tempFeedFile != nil {
+			_ = os.Remove(tempFeedFile.Name())
+		}
+		return err
 	}
-	if chanErr != nil {
-		return chanErr
+	if ret {
+		return nil
 	}
-	err = writeFeed(feedUrl, feedText)
+	err = os.Rename(tempFeedFile.Name(), makeFeedPath(feedUrl))
 	if err != nil {
-		return Error{"Failed to write a feed.", err}
+		return fmt.Errorf("Failed to move a temporary feed file. Caused by %w", err)
 	}
 	return nil
 }
@@ -97,97 +156,58 @@ type Config struct {
 
 func readConfig() (*Config, error) {
 	configPath := filepath.Join(xdg.ConfigHome, appName, "config.yaml")
-	configFile, err := openFileAndCreateIfNecessaryRecursive(configPath, os.O_RDONLY, 0777)
+	configFile, err := os.Open(configPath)
 	if err != nil {
-		return nil, Error{"Failed to open a config: " + configPath, err}
+		return nil, fmt.Errorf("Failed to open a config: %s. Caused by %w", configPath, err)
 	}
 	defer configFile.Close()
-	configBytes, err := io.ReadAll(configFile)
+	var config Config
+	err = yaml.NewDecoder(configFile).Decode(&config)
 	if err != nil {
-		return nil, Error{"Failed to read a config: " + configPath, err}
-	}
-	config, err := unmarshalConfig(configBytes)
-	if err != nil {
-		return nil, Error{"Failed to unmarshal a config: " + configPath, err}
+		return nil, fmt.Errorf("Failed to unmarshal a config: %s. Caused by %w", configPath, err)
 	}
 	if len(config.Run) < 1 {
-		return nil, Error{"\"run\" field must have some strings: " + configPath, err}
-	}
-	return config, nil
-}
-
-func unmarshalConfig(bytes []byte) (*Config, error) {
-	var config Config
-	err := yaml.Unmarshal(bytes, &config)
-	if err != nil {
-		return nil, Error{"Failed to unmarshal the config.", err}
+		return nil, fmt.Errorf("\"run\" field must have some strings: %s. Caused by %w", configPath, err)
 	}
 	return &config, nil
 }
 
 func makeFeedPath(url_ string) string {
-	return filepath.Join(dataPath, url.QueryEscape(url_)+".xml")
+	return filepath.Join(dataDirPath, url.QueryEscape(url_)+".xml")
 }
 
-func writeFeed(url string, content string) error {
-	file, err := openFileAndCreateIfNecessaryRecursive(makeFeedPath(url), os.O_WRONLY, 0777)
+func download(client http.Client, url string) (io.ReadCloser, error) {
+	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
-		return Error{"Failed to open a feed file.", err}
+		return nil, fmt.Errorf("Failed to create a HTTP request. Caused by %w", err)
 	}
-	defer file.Close()
-	_, err = file.Write([]byte(content)) // 手抜き
+	resp, err := client.Do(req)
 	if err != nil {
-		return Error{"Failed to write a feed file.", err}
+		return nil, fmt.Errorf("Failed to request via HTTP. Caused by %w", err)
 	}
-	return nil
-}
-
-func readFeed(url string) (*string, error) {
-	bytes, err := (os.ReadFile(makeFeedPath(url)))
-	if os.IsNotExist(err) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, Error{"Failed to read a file.", err}
-	}
-	text := string(bytes)
-	return &text, nil
-}
-
-func openFileAndCreateIfNecessaryRecursive(path string, flag int, mode os.FileMode) (*os.File, error) {
-	file, err := os.OpenFile(path, flag, mode)
-	if err != nil {
-		if !os.IsNotExist(err) {
-			return nil, Error{path + ": Failed to open the file.", err}
+	if resp.StatusCode/100 != 2 {
+		bodyBytes, err := io.ReadAll(resp.Request.Body)
+		if err == nil {
+			return nil, fmt.Errorf(`A status code for an HTTP post is not 200: %s: "%s".`, resp.Status, string(bodyBytes))
 		} else {
-			file, err = os.Create(path)
-			if err != nil {
-				if !os.IsNotExist(err) {
-					return nil, Error{path + ": Failed to create the file.", err}
-				}
-				dir := filepath.Dir(path)
-				err = os.MkdirAll(dir, 0755)
-				if err != nil {
-					return nil, Error{dir + ": Failed to create the directory.", err}
-				}
-				file, err = os.Create(path)
-				if err != nil {
-					return nil, Error{path + ": Failed to create the file after creating the directory.", err}
-				}
-			}
+			return nil, fmt.Errorf("A status code for an HTTP post is not 200: %s.", resp.Status)
 		}
 	}
-	return file, nil
+	return resp.Body, nil
 }
 
-type Error struct {
-	Message string
-	Origin  error
-}
-
-func (e Error) Error() string {
-	if e.Origin == nil {
-		return e.Message
+// 新規の方に前のよりも古いアイテムが含まれてる場合は目をつぶる
+func subtractFeed(left, right gofeed.Feed) gofeed.Feed {
+	var result gofeed.Feed
+	result = left
+left:
+	for i := 0; i < len(left.Items); i++ {
+		for j := 0; j < len(right.Items); j++ {
+			if left.Items[i] == right.Items[j] {
+				continue left
+			}
+		}
+		result.Items = append(result.Items, left.Items[i])
 	}
-	return e.Message + " Caused by: " + e.Origin.Error()
+	return result
 }
