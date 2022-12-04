@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"reflect"
 
 	"path/filepath"
 
@@ -85,7 +86,7 @@ func eachFeed(httpClient http.Client, feedParser gofeed.Parser, config Config, f
 		}
 		newFeed := *feed
 		ret, err := func() (bool, error) {
-			prevFeedFile, err = os.OpenFile(makeFeedPath(feedUrl), os.O_RDWR, 0644)
+			prevFeedFile, err = os.Open(makeFeedPath(feedUrl))
 			if err != nil {
 				if !os.IsNotExist(err) {
 					return true, fmt.Errorf("Failed to open a previous feed file. Caused by %w", err)
@@ -96,7 +97,7 @@ func eachFeed(httpClient http.Client, feedParser gofeed.Parser, config Config, f
 				if err != nil {
 					return true, fmt.Errorf("Failed to parse a previous feed. Caused by %w", err)
 				}
-				newFeed = subtractFeed(*prevFeed, *feed)
+				newFeed = subtractFeed(*feed, *prevFeed)
 				if len(newFeed.Items) == 0 {
 					return true, nil
 				}
@@ -200,10 +201,11 @@ func download(client http.Client, url string) (io.ReadCloser, error) {
 func subtractFeed(left, right gofeed.Feed) gofeed.Feed {
 	var result gofeed.Feed
 	result = left
+	result.Items = make([]*gofeed.Item, 0, len(left.Items))
 left:
 	for i := 0; i < len(left.Items); i++ {
 		for j := 0; j < len(right.Items); j++ {
-			if left.Items[i] == right.Items[j] {
+			if reflect.DeepEqual(left.Items[i], right.Items[j]) {
 				continue left
 			}
 		}
