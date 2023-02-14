@@ -24,7 +24,17 @@ const appName = "feed-trigger"
 var dataDirPath = filepath.Join(xdg.DataHome, appName)
 var configDirPath = filepath.Join(xdg.ConfigHome, appName)
 
+var verbose = false
+
 func main() {
+	if len(os.Args) == 2 {
+		if os.Args[1] == "-v" {
+			verbose = true
+		} else {
+			log.Fatalf("command line arguments must be \"-v\", not \"%s\"", os.Args[1])
+		}
+	}
+	logv("main", "start")
 	exitCode := 0
 	err := prepareAppDirs()
 	if err != nil {
@@ -39,14 +49,16 @@ func main() {
 	for i := 0; i < len(config.Feeds); i++ {
 		err := eachFeed(httpClient, *feedParser, *config, config.Feeds[i])
 		if err != nil {
-			log.Println(err)
+			log.Printf("On a feed: %s. %v", config.Feeds[i], err)
 			exitCode = 1
 		}
 	}
+	logv("main", "exit")
 	os.Exit(exitCode)
 }
 
 func prepareAppDirs() error {
+	logv("prepareAppDirs", "start")
 	dirs := []string{dataDirPath, configDirPath}
 	for i := 0; i < len(dirs); i++ {
 		dir := dirs[i]
@@ -67,6 +79,7 @@ func prepareAppDirs() error {
 }
 
 func eachFeed(httpClient http.Client, feedParser gofeed.Parser, config Config, feedUrl string) error {
+	logv("eachFeed", fmt.Sprintf("start: %s", feedUrl))
 	feedReader, err := download(httpClient, feedUrl)
 	if err != nil {
 		return fmt.Errorf("Failed to download a feed: %s. Caused by %w", feedUrl, err)
@@ -74,18 +87,22 @@ func eachFeed(httpClient http.Client, feedParser gofeed.Parser, config Config, f
 	defer feedReader.Close()
 	var tempFeedFile, prevFeedFile *os.File
 	ret, err := func() (bool, error) {
+		logv("eachFeed", "create temp file")
 		tempFeedFile, err = os.CreateTemp(dataDirPath, "")
 		if err != nil {
 			return true, fmt.Errorf("Failed to create a temporary feed file. Caused by %w", err)
 		}
 		defer tempFeedFile.Close()
+		logv("eachFeed", fmt.Sprintf("created temp file is %s", tempFeedFile.Name()))
 		teedFeedReader := io.TeeReader(feedReader, tempFeedFile)
+		logv("eachFeed", "parse feed")
 		feed, err := feedParser.Parse(teedFeedReader)
 		if err != nil {
 			return true, fmt.Errorf("Failed to parse a feed. Caused by %w", err)
 		}
 		newFeed := *feed
 		ret, err := func() (bool, error) {
+			logv("eachFeed", "open previous feed file")
 			prevFeedFile, err = os.Open(makeFeedPath(feedUrl))
 			if err != nil {
 				if !os.IsNotExist(err) {
@@ -93,12 +110,15 @@ func eachFeed(httpClient http.Client, feedParser gofeed.Parser, config Config, f
 				}
 			} else {
 				defer prevFeedFile.Close()
+				logv("eachFeed", "perse previous feed file")
 				prevFeed, err := feedParser.Parse(prevFeedFile)
 				if err != nil {
 					return true, fmt.Errorf("Failed to parse a previous feed. Caused by %w", err)
 				}
+				logv("eachFeed", "subtract feed")
 				newFeed = subtractFeed(*feed, *prevFeed)
 				if len(newFeed.Items) == 0 {
+					logv("eachFeed", "no new items")
 					return true, nil
 				}
 			}
@@ -125,6 +145,7 @@ func eachFeed(httpClient http.Client, feedParser gofeed.Parser, config Config, f
 				chanErr = fmt.Errorf("Failed to write a feed to a standard-in pipe. Caused by %w", err)
 			}
 		}()
+		logv("eachFeed", "run command")
 		err = cmd.Run()
 		if err != nil {
 			return true, fmt.Errorf("Failed to run a command. Caused by %w", err)
@@ -136,13 +157,16 @@ func eachFeed(httpClient http.Client, feedParser gofeed.Parser, config Config, f
 	}()
 	if err != nil {
 		if tempFeedFile != nil {
+			logv("eachFeed", "remove temp file on error")
 			_ = os.Remove(tempFeedFile.Name())
 		}
 		return err
 	}
 	if ret {
+		logv("eachFeed", "remove temp file on no error")
 		return nil
 	}
+	logv("eachFeed", "rename temp file")
 	err = os.Rename(tempFeedFile.Name(), makeFeedPath(feedUrl))
 	if err != nil {
 		return fmt.Errorf("Failed to move a temporary feed file. Caused by %w", err)
@@ -187,7 +211,7 @@ func download(client http.Client, url string) (io.ReadCloser, error) {
 		return nil, fmt.Errorf("Failed to request via HTTP. Caused by %w", err)
 	}
 	if resp.StatusCode/100 != 2 {
-		bodyBytes, err := io.ReadAll(resp.Request.Body)
+		bodyBytes, err := io.ReadAll(resp.Body)
 		if err == nil {
 			return nil, fmt.Errorf(`A status code for an HTTP post is not 200: %s: "%s".`, resp.Status, string(bodyBytes))
 		} else {
@@ -212,4 +236,9 @@ left:
 		result.Items = append(result.Items, left.Items[i])
 	}
 	return result
+}
+
+func logv(function, message string) {
+	if !verbose { return }
+	fmt.Printf("feed-trigger: %s: %s\n", function, message)
 }
