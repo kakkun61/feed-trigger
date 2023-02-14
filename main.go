@@ -164,7 +164,7 @@ func eachFeed(httpClient http.Client, feedParser gofeed.Parser, config Config, f
 	}
 	if ret {
 		logv("eachFeed", "remove temp file on no error")
-		return nil
+		return os.Remove(tempFeedFile.Name())
 	}
 	logv("eachFeed", "rename temp file")
 	err = os.Rename(tempFeedFile.Name(), makeFeedPath(feedUrl))
