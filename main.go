@@ -64,7 +64,7 @@ func prepareAppDirs() error {
 		dir := dirs[i]
 		file, err := os.Open(dir)
 		if os.IsNotExist(err) {
-			err := os.Mkdir(dir, os.ModeDir|0755)
+			err := os.MkdirAll(dir, os.ModeDir|0755)
 			if err != nil {
 				return fmt.Errorf("Failed to create a directory: %s. Caused by %w", dir, err)
 			}
